@@ -1,0 +1,141 @@
+let
+    Source = Excel.CurrentWorkbook(){[Name="Table1"]}[Content],
+    Renamed = Table.RenameColumns(Source, {{"Column1", "Line"}}),
+    Indexed = Table.AddIndexColumn(Renamed, "RowIndex", 0, 1, Int64.Type),
+
+    AddRecordStart = Table.AddColumn(Indexed, "RecordKey", each 
+        let
+            line = Text.Trim([Line]),
+            ssnCandidate = Text.Start(line, 11)
+        in
+            if Text.Middle(ssnCandidate, 3, 1) = "-" and Text.Middle(ssnCandidate, 6, 1) = "-" then ssnCandidate else null
+    ),
+
+    FillKeys = Table.FillDown(AddRecordStart, {"RecordKey"}),
+
+    Grouped = Table.Group(FillKeys, "RecordKey", {{"AllLines", each _, type table [Line=text, RowIndex=number, RecordKey=text]}}),
+
+    CleanAmount = (text) =>
+        let
+            safeText = if text = null then "" else Text.From(text),
+            digitsOnly = Text.Select(safeText, {"0".."9"}),
+            result = try Number.FromText(digitsOnly) otherwise null
+        in
+            result,
+
+    CleanText = (text) => 
+        if text = null then null 
+        else Text.Trim(Text.Replace(Text.Replace(Text.From(text), """", ""), """", "")),
+
+    Extracted = Table.AddColumn(Grouped, "Record", each
+        let
+            lines = Table.Column([AllLines], "Line"),
+            ssnLine = List.First(lines),
+            SSN = 
+            if ssnLine <> null then
+                let
+                    trimmed = Text.Trim(ssnLine),
+                    ssnMatch = Text.Middle(trimmed, 0, 11),
+                    isSSN = Text.Middle(ssnMatch, 3, 1) = "-" and Text.Middle(ssnMatch, 6, 1) = "-" and Text.Length(ssnMatch) = 11,
+cleanSSN = Text.Select(ssnMatch, {"0".."9"})
+    in
+        if isSSN then cleanSSN else null
+            else  null,
+            nameLine = try List.First(List.Select(lines, each Text.StartsWith(Text.TrimStart(_), "*"))) otherwise null, 
+            
+            addrLine = try List.First(List.Select(lines, each Text.Contains(_, " RD") or Text.Contains(_, " ST") or Text.Contains(_, " DR") 
+            or Text.Contains(_, " AVE") or Text.Contains(_, " LANE") or Text.Contains(_, " ROUTE") or Text.Contains(_, " NORTH") or Text.Contains(_, " EAST")
+            or Text.Contains(_, " WEST") or Text.Contains(_, " SOUTH") or Text.Contains(_, " COURT") or Text.Contains(_, " CIRCLE") or Text.Contains(_, " LN")
+            or Text.Contains(_, " ROAD") or Text.Contains(_, " STREET") or Text.Contains(_, " AVENUE") or Text.Contains(_, " APT") or Text.Contains(_, " APARTMENT"))) otherwise null,
+                        
+            CityStateZip = 
+                if cityLine <> null and 
+                (Text.Contains(Text.Upper(cityLine), ", PA") or Text.Contains(Text.Upper(cityLine), ", OH")) then
+                    let
+                        parts = Text.Split(Text.Trim(cityLine), " "),
+                        zipCode = List.Last(parts),
+                        commaPos = if Text.Contains(Text.Upper(cityLine), ", PA") 
+                                then Text.PositionOf(Text.Upper(cityLine), ", PA") 
+                                else Text.PositionOf(Text.Upper(cityLine), ", OH"),
+                        stateAbbr = if Text.Contains(Text.Upper(cityLine), ", PA") then "PA" else "OH",
+                        cityName = if commaPos > 0 then Text.Start(cityLine, commaPos) else null,
+                        fullCityStateZip = if cityName <> null and zipCode <> null then 
+                            Text.Trim(cityName) & ", " & stateAbbr & " " & Text.Select(zipCode, {"0".."9"})
+                        else 
+                            null
+                    in
+                        fullCityStateZip
+                else 
+                    null,
+
+            cityLine = try List.First(List.Select(lines, each Text.Contains(_, ", PA"))) otherwise null,
+            pheaaLine = try List.First(List.Select(lines, each Text.Contains(_, "PHEAA ACTION"))) otherwise null,
+            eligibilityLine = try List.First(List.Select(lines, each Text.Contains(_, "DEPENDENT") or Text.Contains(_, "INDEPENDENT"))) otherwise null,
+            gradLine = try List.First(List.Select(lines, each Text.Contains(_, "GRADUATED"))) otherwise null,
+            priorLine = try List.First(List.Select(lines, each Text.Contains(_, "PRIOR TERM"))) otherwise null,
+            grantLine = try List.First(List.Select(lines, each Text.Contains(_, "$"))) otherwise null,
+
+            grantClean = if grantLine <> null then Text.Trim(grantLine) else "",
+            tokens = List.Select(Text.SplitAny(grantClean, " "), each Text.Length(_) > 0),
+            grantTokens = List.Select(tokens, each Text.StartsWith(_, "$") or Text.Lower(_) = "none"),
+
+            FallRaw           = try grantTokens{0}  otherwise null,
+            SpringRaw         = try grantTokens{1}  otherwise null,
+            TotalRaw          = try grantTokens{2}  otherwise null,
+            DueRaw            = try grantTokens{3}  otherwise null,
+            DisbursementRaw   = try grantTokens{4}  otherwise null,
+            PheaaCurrentRaw   = try grantTokens{5}  otherwise null,
+            RefundRaw         = try grantTokens{6}  otherwise null,
+            RequestRaw        = try grantTokens{7}  otherwise null, 
+            CommentsRaw       = try Text.Combine(List.Skip(grantTokens, 8), " ") otherwise null,
+
+            cityLineRaw       = if cityLine <> null then CleanText(Text.Trim(cityLine)) else "",
+
+            // Find modes
+            modesFound = List.Select(
+                {"MODE 1", "MODE 2", "MODE 3", "MODE 4"},
+                each Text.Contains(Text.Upper(cityLineRaw), _)
+            ),
+            modesCleaned = List.RemoveNulls(modesFound),
+            modesStandard = List.Transform(modesCleaned, each Text.Replace(_, " ", "")),
+
+            // Find REMED EXCEP
+            remedExcpText = 
+                if Text.Contains(Text.Upper(cityLineRaw), "REMED. EXCEP.") then
+                    try Text.Middle(cityLineRaw, Text.PositionOf(Text.Upper(cityLineRaw), "REMED. EXCEP.") + 14, 6) 
+                    otherwise null
+                else
+                    null,
+            remedExcpCleaned = if remedExcpText <> null then Text.Trim(remedExcpText) else null
+
+        in 
+            [
+                RecordKey = [RecordKey],
+                SSN = CleanText(SSN),
+                FullName = try if nameLine <> null then CleanText(Text.AfterDelimiter(nameLine, "*")) else null otherwise null,
+                StreetAddress = if addrLine <> null then CleanText(addrLine) else null,
+                CityStateZip = CityStateZip,
+                PHEAA_Action = if pheaaLine <> null then CleanText(Text.AfterDelimiter(pheaaLine, "-")) else null,
+                Eligibility = CleanText(eligibilityLine),
+                GraduationTerm = if gradLine <> null then CleanText(gradLine) else null,
+                PriorTerms = if priorLine <> null then CleanText(Text.AfterDelimiter(priorLine, "-")) else null,
+                FallAmount = CleanAmount(FallRaw),
+                SpringAmount = CleanAmount(SpringRaw),
+                TotalGrant = CleanAmount(TotalRaw),
+                AmountDue = CleanAmount(DueRaw),
+                Disbursement = CleanAmount(DisbursementRaw),
+                PHEAA_Current = Text.Trim(PheaaCurrentRaw),
+                Refund_Previous = Text.Trim(RefundRaw),
+                Requests = Text.Trim(RequestRaw),
+                College_Comments = Text.Trim(CommentsRaw),
+                Modes_All = Text.Combine(modesCleaned, ", "),
+                RemedExcpt_All = if remedExcpCleaned = null then "" else remedExcpCleaned
+
+            ]
+    ),
+    #"Expanded Record" = Table.ExpandRecordColumn(Extracted, "Record", {"SSN", "FullName", "StreetAddress", "CityStateZip", 
+    "PHEAA_Action", "Eligibility", "GraduationTerm", "PriorTerms", "FallAmount", "SpringAmount", "TotalGrant", "AmountDue", "Disbursement",
+    "PHEAA_Current", "Refund_Previous", "Requests", "College_Comments", "Modes_All", "RemedExcpt_All"}
+    )
+in
+    #"Expanded Record"
