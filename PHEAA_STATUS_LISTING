@@ -1,0 +1,226 @@
+let
+    Source = Excel.CurrentWorkbook(){[Name="Table1"]}[Content],
+    Renamed = Table.RenameColumns(Source, {{"Column1", "Line"}}),
+    Indexed = Table.AddIndexColumn(Renamed, "RowIndex", 0, 1, Int64.Type),
+
+    AddRecordStart = Table.AddColumn(Indexed, "RecordKey", each 
+        let
+            line = Text.Trim([Line]),
+            ssnCandidate = Text.Start(line, 11)
+        in
+            if Text.Middle(ssnCandidate, 3, 1) = "-" and Text.Middle(ssnCandidate, 6, 1) = "-" then ssnCandidate else null
+    ),
+
+    FillKeys = Table.FillDown(AddRecordStart, {"RecordKey"}),
+
+    Grouped = Table.Group(FillKeys, "RecordKey", {{"AllLines", each _, type table [Line=text, RowIndex=number, RecordKey=text]}}),
+
+    CleanAmount = (text) =>
+        let
+            safeText = if text = null then "" else Text.From(text),
+            digitsOnly = Text.Select(safeText, {"0".."9"}),
+            result = try Number.FromText(digitsOnly) otherwise null
+        in
+            result,
+
+    CleanText = (text) => 
+        if text = null then null 
+        else Text.Trim(Text.Replace(Text.Replace(Text.From(text), """", ""), """", "")),
+
+    Extracted = Table.AddColumn(Grouped, "Record", each
+        let
+            lines = Table.Column([AllLines], "Line"),
+
+            ssnLine = List.First(lines),
+
+            SSN = 
+             if ssnLine <> null then
+                let
+                    trimmed = Text.Trim(ssnLine),
+                    ssnMatch = Text.Middle(trimmed, 0, 11),
+                    isSSN = Text.Middle(ssnMatch, 3, 1) = "-" and Text.Middle(ssnMatch, 6, 1) = "-" and Text.Length(ssnMatch) = 11,
+cleanSSN = Text.Select(ssnMatch, {"0".."9"})
+    in
+        if isSSN then cleanSSN else null 
+              else null,
+               
+            nameLine =
+                    try List.First( List.Select(lines, each 
+                                    Text.Contains(_, ",") and Text.Upper(Text.Start(_, Text.PositionOf(_, ","))) = Text.Start(_, Text.PositionOf(_, ","))  // ensures last name is uppercase
+                                    and Text.PositionOf(_, ",") > 0))
+                    otherwise null,
+
+            FullName =
+                    if nameLine <> null then
+                        let
+                            tokens = Text.Split(nameLine, " "),
+                            commaIndex = List.PositionOfAny(tokens, List.Select(tokens, each Text.Contains(_, ","))),
+                            namePart = if commaIndex >= 0 then Text.Combine(List.FirstN(tokens, commaIndex + 2), " ") else tokens{0}
+                        in
+                            CleanText(namePart)
+                    else null,
+
+                        
+            nameIndex = try List.PositionOf(lines, nameLine) otherwise 0,
+
+            addrLine =     
+            try List.First(
+                List.Select(
+            List.Skip(lines, nameIndex + 1),
+            each Text.Contains(_, " RD") or Text.Contains(_, " ST") or Text.Contains(_, " DR") 
+            or Text.Contains(_, " AVE") or Text.Contains(_, " LANE") or Text.Contains(_, " ROUTE") 
+            or Text.Contains(_, " NORTH") or Text.Contains(_, " EAST") or Text.Contains(_, " WEST") 
+            or Text.Contains(_, " SOUTH") or Text.Contains(_, " COURT") or Text.Contains(_, " CIRCLE") 
+            or Text.Contains(_, " LN") or Text.Contains(_, " ROAD") or Text.Contains(_, " STREET") 
+            or Text.Contains(_, " AVENUE") or Text.Contains(_, " APT") or Text.Contains(_, " APARTMENT") 
+            or Text.Contains(_, " WAY") or Text.Contains(_, " CT") or Text.Contains(_, " CIR") 
+            or Text.Contains(_, " PLACE") or Text.Contains(_, " PL")  
+                             )
+                         ) otherwise null,
+            
+            cityLine = try List.First(List.Select(lines, each Text.Contains(_, ", PA") or Text.Contains(_, ", OH"))) otherwise null,
+                        
+            CityStateZip = 
+                if cityLine <> null and 
+                (Text.Contains(Text.Upper(cityLine), ", PA") or Text.Contains(Text.Upper(cityLine), ", OH")) then
+                    let
+                        parts = Text.Split(Text.Trim(cityLine), " "),
+                        zipCode = List.Last(parts),
+                        commaPos = if Text.Contains(Text.Upper(cityLine), ", PA") 
+                                then Text.PositionOf(Text.Upper(cityLine), ", PA") 
+                                else Text.PositionOf(Text.Upper(cityLine), ", OH"),
+                        stateAbbr = if Text.Contains(Text.Upper(cityLine), ", PA") then "PA" else "OH",
+                        cityName = if commaPos > 0 then Text.Start(cityLine, commaPos) else null,
+                        fullCityStateZip = if cityName <> null and zipCode <> null then 
+                            Text.Trim(cityName) & ", " & stateAbbr & " " & Text.Select(zipCode, {"0".."9"})
+                        else null
+                    in
+                        fullCityStateZip
+                else null,
+
+            specialStatusLine = try List.First(List.Select(lines, each Text.Contains(_, "VETERAN") or Text.Contains(_, "NOT STATE GRANT APPLICANT"))) otherwise null,
+
+            SpecialStatus = 
+                if specialStatusLine <> null then 
+                if Text.Contains(specialStatusLine, "VETERAN") then "VETERAN" 
+                else if Text.Contains(specialStatusLine, "NOT STATE GRANT APPLICANT") then "NOT STATE GRANT APPLICANT" 
+                else if Text.Contains(specialStatusLine, "DIFF. SCHOOL)") then "DIFF. SCHOOL)"
+                else null else null,
+
+            priorLine = try List.First(List.Select(lines, each Text.Contains(_, "PRIOR TERM(S):"))) otherwise null,
+
+            PriorTerms = 
+              if priorLine <> null and Text.Contains(priorLine, "PRIOR TERM(S):") then
+                        let
+                            afterLabel = Text.AfterDelimiter(priorLine, "PRIOR TERM(S):", 0),
+                            cleanPart = 
+                                if Text.Contains(afterLabel, "ENRL MDE:") then 
+                                    Text.BeforeDelimiter(afterLabel, "ENRL MDE:")
+                                else 
+                                    afterLabel
+                        in
+                            CleanText(cleanPart)
+                    else null,
+
+            PHEAAStatusTerms =
+                let
+                validPhrases = {
+                    "1ST: $  300", "2ND: $  300",
+                    "1ST: CANCELLED - A", "2ND: CANCELLED - A",
+                    "1ST: CANCELLED - G", "2ND: CANCELLED - G",
+                    "1ST: REJECT T", "2ND: REJECT T",
+                    "1ST: REJECT L", "2ND: REJECT L"
+                },
+
+            allMatches =
+                    List.Select(validPhrases, each 
+                        List.AnyTrue(List.Transform(lines, (line) => Text.Contains(line, _))) ),
+                result = Text.Combine(allMatches, ", ")
+                in
+                if result = "" then "" else result,
+
+            priorGrantLine =
+                try List.First(
+                     List.Select(lines, each 
+                         List.AnyTrue(
+                             List.Transform(
+                                   Text.Split(_, " "),
+                                     (t) =>
+                                         let
+                                           isNumeric = try Value.Is(Value.FromText(t), type number) otherwise false
+                                     in
+                                        Text.Contains(t, ".") and Text.Length(Text.AfterDelimiter(t, ".", 0)) = 2 and isNumeric
+                                            )
+                                     )
+                                )
+                             )
+                             otherwise null,
+
+            PRIORGRANTS =
+                if priorGrantLine <> null then
+                    let
+                        tokens = Text.Split(priorGrantLine, " "),
+                        grants = List.Select(tokens, each 
+                            Text.Contains(_, ".") 
+                            and Text.Length(Text.AfterDelimiter(_, ".", 0)) = 2
+                            and (try Value.Is(Value.FromText(_), type number) otherwise false)
+                        ),
+                        result = if List.Count(grants) > 0 then grants{0} else null
+                    in
+                        result
+                else null,
+
+            saiLine = 
+                try List.First( List.Select(lines, each List.AnyTrue( List.Transform( Text.Split(_, " "),
+                    (t) =>  not Text.Contains(t, ".") 
+                        and (try Value.Is(Value.FromText(Text.Remove(t, {","})), type number) otherwise false)) ) ) ) otherwise null,
+
+            SAI = 
+                if saiLine <> null then 
+                    let numbers = List.Select(Text.Split(saiLine, " "), each 
+                            try Value.Is(Value.FromText(Text.Remove(_, {","})), type number) otherwise false
+                            and not Text.Contains(_, ".") ),
+                        saiVal = if List.Count(numbers) > 0 then Text.Remove(numbers{0}, {","}) else null
+                    in
+                        saiVal else null,
+
+            enrlLine = 
+                    try 
+                        List.First(List.Select(lines, each 
+                                Text.Contains(_, " FT") or Text.Contains(_, " HT") or Text.Contains(_, " QT") or Text.Contains(_, " LH") ) )
+                    otherwise null,
+
+            ENRLSTATUS = 
+                    if enrlLine <> null then
+                        let tokens = Text.Split(enrlLine, " "),
+                            status = List.Last(List.Select(tokens, each _ = "FT" or _ = "HT" or _ = "LH" or _ = "QT"))
+                        in
+                            status else null,
+
+            enrlMdeLine = try List.First(List.Select(lines, each 
+                Text.Contains(_, "F-100% CLASSROOM,S-100% CLASSROOM") or Text.Contains(_, "F-<=50% DE,S-<=50% DE") or Text.Contains(_, "F-100% CLASSROOM")
+                or Text.Contains(_, "F-<=50% DE,S-100% CLASSROOM"))) otherwise null,
+            
+            ENRLMODE = 
+                if enrlMdeLine <> null and Text.Contains(enrlMdeLine, "ENRL MDE:") then
+                    CleanText(Text.AfterDelimiter(enrlMdeLine, "ENRL MDE:", 0))
+                else 
+                    null
+       in 
+            [
+                SSN = SSN,
+                FullName = FullName,
+                StreetAddress = addrLine,
+                CityStateZip = CityStateZip,
+                SpecialStatus = SpecialStatus,
+                PriorTerms = PriorTerms,
+                PHEAAStatusTerms = PHEAAStatusTerms,
+                SAI = SAI,
+                ENRL = ENRLSTATUS,
+                PRIORGRANTS = PRIORGRANTS,
+                ENRLMODE = ENRLMODE
+            ]
+    ),
+    #"Expanded Record" = Table.ExpandRecordColumn(Extracted, "Record", {"SSN", "FullName", "StreetAddress", "CityStateZip", "PriorTerms","SpecialStatus","PHEAAStatusTerms","SAI","ENRL","PRIORGRANTS","ENRLMODE"})
+in
+    #"Expanded Record"
